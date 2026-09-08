@@ -19,11 +19,56 @@ if TYPE_CHECKING:
     from mcp_use.client.client import MCPClient
 
 
+# Denylist of dangerous dunder attribute-access patterns commonly used to escape
+# restricted Python namespaces. The classic gadget is walking an object's class
+# hierarchy to reach an unrestricted class already loaded in the process, e.g.:
+#   ().__class__.__base__.__subclasses__()  # -> every loaded class, including
+#                                            #    subprocess.Popen, etc.
+# This works on ANY object already present in the namespace (including our own
+# tool-wrapper functions), so it does not depend on `type`, `eval`, `exec`, or
+# `import` being reachable.
+#
+# IMPORTANT: This is a defense-in-depth denylist, NOT a sandbox. It is a simple
+# substring scan and can be bypassed by string obfuscation or dynamic attribute
+# construction, e.g.:
+#   getattr(x, chr(95) * 2 + "class" + chr(95) * 2)
+#   name = "__sub" + "classes__"; getattr(y, name)
+# The only real isolation boundary for untrusted code is running with
+# `MCPClient(sandbox=True)`, which executes code in an isolated E2B sandbox
+# rather than in-process via `exec()`.
+DANGEROUS_PATTERNS: list[str] = [
+    "__subclasses__",
+    "__globals__",
+    "__base__",
+    "__bases__",
+    "__mro__",
+    "__import__",
+    "__builtins__",
+    "__code__",
+    "__closure__",
+    "__getattribute__",
+]
+
+
 class CodeExecutor:
     """Executes Python code with access to MCP tools in a restricted namespace.
 
-    This class provides a secure execution environment where agent-written code
-    can call MCP tools through dynamically generated wrapper functions.
+    This class provides a best-effort restricted execution environment where
+    agent-written code can call MCP tools through dynamically generated wrapper
+    functions. It is NOT a security sandbox and has two known limitations:
+
+    1. Namespace hardening (removing `type` from builtins, denylisting dangerous
+       dunder patterns like `__subclasses__`/`__globals__`) is defense-in-depth,
+       not isolation. Determined, obfuscated code can still escape an in-process
+       `exec()`-based namespace. For untrusted code, multi-tenant environments,
+       or production use, run with `MCPClient(sandbox=True)` to execute in an
+       isolated E2B sandbox instead.
+    2. The per-execution timeout (see `execute()`) is implemented with
+       `asyncio.wait_for`, which relies on cooperative cancellation at `await`
+       points. It CANNOT preempt a blocking, CPU-bound synchronous loop with no
+       `await` in it (e.g. `while True: pass`) — such code will run past the
+       configured timeout until the underlying process is killed. A true fix
+       would require running the code in a separate subprocess.
     """
 
     def __init__(self, client: "MCPClient"):
@@ -38,6 +83,16 @@ class CodeExecutor:
     async def execute(self, code: str, timeout: float = 30.0) -> dict[str, Any]:
         """Execute Python code with access to MCP tools.
 
+        Security notes (see also the class docstring):
+            - Before execution, `code` is scanned for a denylist of dangerous
+              dunder patterns (see `DANGEROUS_PATTERNS`) such as `__subclasses__`
+              and `__globals__`. This is a defense-in-depth mitigation against
+              the most common sandbox-escape gadgets, NOT a sandbox. It can be
+              bypassed via string obfuscation. Use `MCPClient(sandbox=True)` for
+              untrusted code.
+            - `timeout` is enforced via `asyncio.wait_for`, which cannot preempt
+              a blocking, CPU-bound synchronous loop with no `await` points.
+
         Args:
             code: Python code to execute.
             timeout: Execution timeout in seconds.
@@ -49,6 +104,30 @@ class CodeExecutor:
                 - error: Error message if execution failed (None on success)
                 - execution_time: Time taken to execute in seconds
         """
+        start_time = time.time()
+
+        # Defense-in-depth: refuse to execute code containing known dangerous
+        # dunder attribute-access patterns before doing anything else (including
+        # before connecting to any servers). See DANGEROUS_PATTERNS and the
+        # class docstring for why this is a mitigation, not a sandbox.
+        blocked_pattern = self._find_dangerous_pattern(code)
+        if blocked_pattern is not None:
+            error_message = (
+                f"Execution refused: code contains disallowed pattern '{blocked_pattern}'. "
+                "This pattern is commonly used to escape restricted Python namespaces "
+                "(e.g. walking an object's __class__/__base__/__subclasses__ chain to reach "
+                "unrestricted classes like subprocess.Popen). Remove this pattern and retry. "
+                "Note this is a denylist-based mitigation, not a full sandbox; for untrusted "
+                "code, create the client with MCPClient(sandbox=True)."
+            )
+            logger.warning(f"Blocked code execution due to dangerous pattern: {blocked_pattern}")
+            return {
+                "result": None,
+                "logs": [],
+                "error": error_message,
+                "execution_time": time.time() - start_time,
+            }
+
         # Ensure all servers are connected (lazy connection)
         # We check client.sessions directly to see internal state
         configured_servers = set(self.client.get_server_names())
@@ -59,7 +138,6 @@ class CodeExecutor:
             logger.debug("Connecting to configured servers for code execution...")
             await self.client.create_all_sessions()
 
-        start_time = time.time()
         logs: list[str] = []
         result = None
         error = None
@@ -102,6 +180,28 @@ class CodeExecutor:
             logs.extend([f"[ERROR] {line}" for line in stderr_capture.getvalue().strip().split("\n")])
 
         return {"result": result, "logs": logs, "error": error, "execution_time": execution_time}
+
+    def _find_dangerous_pattern(self, code: str) -> str | None:
+        """Scan code for denylisted dangerous dunder patterns.
+
+        This is a simple substring scan used as a defense-in-depth measure to catch
+        obvious sandbox-escape attempts (e.g. walking `__class__`/`__base__` chains
+        to reach `__subclasses__()` and pivot to unrestricted classes). It is NOT a
+        sandbox: it can be bypassed via string obfuscation or dynamic attribute-name
+        construction (e.g. `getattr(x, chr(95) * 2 + "class" + chr(95) * 2)`). The
+        only real isolation boundary for untrusted code is `MCPClient(sandbox=True)`
+        (E2B).
+
+        Args:
+            code: Python source code to scan.
+
+        Returns:
+            The first matched dangerous pattern, or None if none were found.
+        """
+        for pattern in DANGEROUS_PATTERNS:
+            if pattern in code:
+                return pattern
+        return None
 
     async def _execute_code(self, code: str, namespace: dict[str, Any]) -> Any:
         """Execute code in the given namespace.
@@ -159,7 +259,14 @@ class CodeExecutor:
             "isinstance": isinstance,
             "hasattr": hasattr,
             "getattr": getattr,
-            "type": type,
+            # NOTE: `type` is intentionally NOT exposed here. `type(obj)` is the
+            # canonical entry point for the `().__class__.__base__.__subclasses__()`
+            # style sandbox-escape gadget. Removing it does not fully close the
+            # gadget (any object already in the namespace still exposes
+            # `.__class__` as an attribute access, not a builtin call), so this is
+            # combined with the DANGEROUS_PATTERNS denylist above. Callers who need
+            # real `type()` semantics for untrusted code should use
+            # `MCPClient(sandbox=True)`.
             "repr": repr,
             "None": None,
             "True": True,

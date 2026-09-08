@@ -158,6 +158,53 @@ class TestCodeExecutorSecurity:
         assert result["error"] is not None
 
     @pytest.mark.asyncio
+    async def test_type_not_in_safe_builtins(self, code_executor):
+        """Test that `type` is removed from safe_builtins (sandbox-escape gadget)."""
+        namespace = await code_executor._build_namespace()
+        safe_builtins = namespace["__builtins__"]
+        assert "type" not in safe_builtins
+        # isinstance must still be available; it's needed for normal code and
+        # doesn't expose subclass-walking on its own.
+        assert "isinstance" in safe_builtins
+
+    @pytest.mark.asyncio
+    async def test_denylisted_pattern_subclasses_blocked(self, code_executor):
+        """Test that the classic __class__.__base__.__subclasses__() escape is refused."""
+        code = "return ().__class__.__base__.__subclasses__()"
+
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["error"] is not None
+        assert "subclasses" in result["error"].lower() or "__subclasses__" in result["error"]
+        assert result["result"] is None
+
+    @pytest.mark.asyncio
+    async def test_denylisted_pattern_globals_blocked(self, code_executor):
+        """Test that __globals__ access is refused."""
+        code = "return search_tools.__globals__"
+
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["error"] is not None
+        assert "__globals__" in result["error"]
+        assert result["result"] is None
+
+    @pytest.mark.asyncio
+    async def test_denylisted_pattern_does_not_execute(self, code_executor):
+        """Test that denylisted code never reaches execution (no side effects)."""
+        code = """
+print("this should never be logged")
+return ().__class__.__base__.__subclasses__()
+"""
+
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["error"] is not None
+        assert result["result"] is None
+        # Logs should be empty since the code was refused before execution.
+        assert result["logs"] == []
+
+    @pytest.mark.asyncio
     async def test_safe_builtins_available(self, code_executor):
         """Test that safe builtins are available."""
         code = """

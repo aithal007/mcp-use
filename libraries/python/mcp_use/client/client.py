@@ -5,6 +5,7 @@ This module provides a high-level client that manages MCP servers, connectors,
 and sessions from configuration.
 """
 
+import asyncio
 import json
 import warnings
 from typing import TYPE_CHECKING, Any
@@ -93,6 +94,19 @@ class MCPClient:
         # If code mode is enabled, create internal code mode connector
         if self.code_mode:
             self._setup_code_mode_connector()
+            if not self.sandbox:
+                # code_mode executes LLM-generated code in-process via Python's exec()
+                # (see CodeExecutor). Without sandbox=True, the only protection is a
+                # best-effort denylist of dangerous dunder patterns — this is defense-in-depth,
+                # not a real isolation boundary. Emitted once here at setup time (not
+                # per-execution) so users are informed without changing default behavior.
+                logger.warning(
+                    "MCPClient created with code_mode=True and sandbox=False: generated code "
+                    "will execute in-process (via exec()) with only a denylist-based mitigation "
+                    "against sandbox-escape patterns, not a real isolation boundary. This is not "
+                    "safe for untrusted code or multi-tenant/production use. Set sandbox=True to "
+                    "run code execution inside an isolated E2B sandbox instead."
+                )
 
         servers_list = list(self.config.get("mcpServers", {}).keys()) if self.config else []
         _telemetry.track_client_init(
@@ -338,6 +352,18 @@ class MCPClient:
     ) -> dict[str, MCPSession]:
         """Create sessions for all configured servers.
 
+        Servers are connected concurrently (via `asyncio.gather`), so wall-clock
+        startup time is bounded by the slowest single server's connect+initialize
+        latency rather than the sum of every server's latency. Each server's
+        session is created by an independent `create_session()` coroutine that
+        only touches its own entry in `self.sessions`/`self.active_sessions`, so
+        this is safe to run concurrently under asyncio's single-threaded model.
+
+        Failures still propagate immediately: `asyncio.gather` (without
+        `return_exceptions=True`) raises as soon as any one server's
+        `create_session()` fails, cancelling the remaining in-flight attempts,
+        matching the previous sequential implementation's fail-fast behavior.
+
         Args:
             auto_initialize: Whether to automatically initialize the sessions.
 
@@ -353,10 +379,10 @@ class MCPClient:
             warnings.warn("No MCP servers defined in config", UserWarning, stacklevel=2)
             return {}
 
-        # Create sessions only for allowed servers if applicable else create for all servers
-        for name in servers:
-            if self.allowed_servers is None or name in self.allowed_servers:
-                await self.create_session(name, auto_initialize)
+        # Create sessions concurrently, only for allowed servers if applicable else for all servers
+        names_to_create = [name for name in servers if self.allowed_servers is None or name in self.allowed_servers]
+        if names_to_create:
+            await asyncio.gather(*(self.create_session(name, auto_initialize) for name in names_to_create))
 
         # If code mode is enabled, only expose the code mode session externally
         # Internal components (like CodeExecutor) access self.sessions directly

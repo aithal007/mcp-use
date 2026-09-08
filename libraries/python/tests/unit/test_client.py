@@ -2,9 +2,12 @@
 Unit tests for the MCPClient class.
 """
 
+import asyncio
 import json
+import logging
 import os
 import tempfile
+import time
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import pytest
@@ -62,6 +65,28 @@ class TestMCPClientInitialization:
         finally:
             # Clean up temp file
             os.unlink(temp_path)
+
+    def test_code_mode_without_sandbox_warns(self, caplog):
+        """Test that code_mode=True with sandbox=False (the default) logs a warning
+        explaining that in-process execution is not a real isolation boundary."""
+        with caplog.at_level(logging.WARNING, logger="mcp_use"):
+            client = MCPClient(code_mode=True)
+
+        assert client.code_mode is True
+        assert client.sandbox is False
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("sandbox=True" in msg for msg in warning_messages)
+        assert any("code_mode=True" in msg and "sandbox=False" in msg for msg in warning_messages)
+
+    def test_code_mode_with_sandbox_does_not_warn(self, caplog):
+        """Test that code_mode=True with sandbox=True does not emit the in-process warning."""
+        with caplog.at_level(logging.WARNING, logger="mcp_use"):
+            client = MCPClient(code_mode=True, sandbox=True)
+
+        assert client.code_mode is True
+        assert client.sandbox is True
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("in-process" in msg for msg in warning_messages)
 
     def test_from_config_file(self):
         """Test creation from a config file."""
@@ -520,6 +545,84 @@ class TestMCPClientSessionManagement:
 
         # Verify return value
         assert sessions == client.sessions
+
+    @pytest.mark.asyncio
+    async def test_create_all_sessions_runs_concurrently(self):
+        """Test that create_all_sessions connects to servers concurrently, not sequentially.
+
+        Regression test for the sequential-for-loop bug where wall-clock startup time was
+        the SUM of every server's connect latency instead of the MAX. We patch create_session
+        with a delayed AsyncMock and assert total time is close to a single delay.
+        """
+        config = {
+            "mcpServers": {
+                "server1": {"url": "http://server1.com"},
+                "server2": {"url": "http://server2.com"},
+                "server3": {"url": "http://server3.com"},
+            }
+        }
+        client = MCPClient(config=config)
+        # Disable telemetry so a real (synchronous, network-bound) telemetry capture call
+        # doesn't pollute the wall-clock timing assertion below.
+        client._record_telemetry = False
+
+        delay = 0.3
+
+        async def fake_create_session(name, auto_initialize=True):
+            await asyncio.sleep(delay)
+            client.sessions[name] = MagicMock()
+            client.active_sessions.append(name)
+            return client.sessions[name]
+
+        client.create_session = AsyncMock(side_effect=fake_create_session)
+
+        start = time.monotonic()
+        await client.create_all_sessions()
+        elapsed = time.monotonic() - start
+
+        # If sequential, elapsed would be ~3 * delay (0.9s). Concurrently it should be ~delay.
+        # Generous tolerance to avoid flakiness.
+        assert elapsed < delay * 1.5
+        assert client.create_session.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_create_all_sessions_propagates_failure(self):
+        """Test that a failure in one server's create_session still propagates (fail-fast)."""
+        config = {
+            "mcpServers": {
+                "server1": {"url": "http://server1.com"},
+                "server2": {"url": "http://server2.com"},
+            }
+        }
+        client = MCPClient(config=config)
+
+        async def fake_create_session(name, auto_initialize=True):
+            if name == "server1":
+                raise RuntimeError("boom")
+            await asyncio.sleep(0.2)
+            return MagicMock()
+
+        client.create_session = AsyncMock(side_effect=fake_create_session)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await client.create_all_sessions()
+
+    @pytest.mark.asyncio
+    async def test_create_all_sessions_allowed_servers_filter_concurrent(self):
+        """Test that the allowed_servers filter is still respected when running concurrently."""
+        config = {
+            "mcpServers": {
+                "server1": {"url": "http://server1.com"},
+                "server2": {"url": "http://server2.com"},
+            }
+        }
+        client = MCPClient(config=config, allowed_servers=["server1"])
+
+        client.create_session = AsyncMock(return_value=MagicMock())
+
+        await client.create_all_sessions()
+
+        client.create_session.assert_called_once_with("server1", True)
 
     @pytest.mark.asyncio
     @patch("mcp_use.client.client.create_connector_from_config")
