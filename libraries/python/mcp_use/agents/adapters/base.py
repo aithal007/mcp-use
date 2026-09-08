@@ -4,6 +4,7 @@ Base adapter interface for MCP tools.
 This module provides the abstract base class that all MCP tool adapters should inherit from.
 """
 
+import re
 from abc import ABC, abstractmethod
 from typing import Any, Generic, TypeVar
 
@@ -70,11 +71,41 @@ class BaseAdapter(Generic[T], ABC):
             # Fallback for unexpected types
             return str(tool_result)
 
-    def fix_schema(self, schema: Any) -> Any:
-        """Convert JSON Schema 'type': ['string', 'null'] to 'anyOf' format and fix enum handling.
+    @staticmethod
+    def _is_redundant_title(key: str, title: Any) -> bool:
+        """Check whether a JSON-Schema 'title' merely restates its property key.
+
+        Auto-generated titles (e.g. by pydantic/JSON-schema tooling) typically turn
+        'user_id' into 'User Id' or 'UserId'. Such titles add tokens to the schema
+        sent to the LLM without adding any information beyond the key name itself,
+        so they are safe to drop. A title that differs from a trivial
+        case/underscore-insensitive transform of the key is assumed to carry real
+        information and is left untouched.
+        """
+        if not isinstance(title, str) or not isinstance(key, str):
+            return False
+        normalize = lambda s: re.sub(r"[^a-z0-9]", "", s.lower())  # noqa: E731
+        return normalize(title) == normalize(key)
+
+    def fix_schema(self, schema: Any, _key: str | None = None) -> Any:
+        """Fix MCP JSON Schema quirks and strip token-noise that carries no semantic value.
+
+        Converts 'type': ['string', 'null'] to 'anyOf' format, fixes bare-'enum' handling,
+        and minifies the schema before it is handed to an LLM as part of a tool definition.
+        A single well-populated MCP server can expose tool schemas that run into tens of
+        thousands of tokens; most of that is accidental verbosity (JSON-Schema meta-pointers,
+        auto-generated titles that just restate the property name) rather than information the
+        model needs to call the tool correctly. This strips only that noise:
+          - Drops the '$schema' meta key wherever it appears.
+          - Drops a 'title' that trivially derives from the containing property's key name.
+        It never touches 'description', 'enum', 'required', 'type', 'properties', 'items',
+        'anyOf', 'default', 'additionalProperties', or numeric/pattern constraints - those are
+        semantic, not noise. Safe to call repeatedly (idempotent).
 
         Args:
             schema: The JSON schema to fix.
+            _key: The property key this schema is nested under, if any (used internally to
+                decide whether a 'title' is redundant). Callers should omit this.
 
         Returns:
             The fixed JSON schema.
@@ -88,10 +119,19 @@ class BaseAdapter(Generic[T], ABC):
             if "enum" in schema and "type" not in schema:
                 schema["type"] = "string"
 
+            # Drop the JSON-Schema meta-pointer: never useful to an LLM or to
+            # jsonschema_to_pydantic, pure token overhead.
+            schema.pop("$schema", None)
+
+            # Drop auto-generated titles that just restate the property key (e.g. a
+            # 'user_id' property titled "User Id"). A title with real information is kept.
+            if "title" in schema and _key is not None and self._is_redundant_title(_key, schema["title"]):
+                del schema["title"]
+
             for key, value in schema.items():
-                schema[key] = self.fix_schema(value)  # Apply recursively
+                schema[key] = self.fix_schema(value, _key=key)  # Apply recursively
         elif isinstance(schema, list):
-            return [self.fix_schema(item) for item in schema]
+            return [self.fix_schema(item, _key=_key) for item in schema]
         return schema
 
     async def _get_connectors(self, client: MCPClient) -> list[BaseConnector]:
