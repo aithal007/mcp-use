@@ -123,8 +123,12 @@ Safe Python builtins available in code execution:
 - Type conversions: `str`, `int`, `float`, `bool`
 - Iterations: `range`, `enumerate`, `zip`, `map`, `filter`
 - Aggregations: `len`, `min`, `max`, `sum`, `sorted`, `any`, `all`
-- Utilities: `print`, `isinstance`, `hasattr`, `getattr`
-- Async: `asyncio` module for async operations
+- Utilities: `print`, `isinstance`, `hasattr`, `getattr` (public attributes only)
+- Async: a restricted `asyncio` for concurrency -- `asyncio.gather`, `asyncio.sleep`,
+  `asyncio.wait_for`, `asyncio.shield`, `asyncio.as_completed`, and the lock/queue
+  primitives. Use `asyncio.gather(...)` to run several tool calls at once.
 
-Note: File I/O, imports, and eval are restricted for security.
+Note: File I/O, imports, eval, subprocess/process spawning, network sockets, and
+access to private/dunder attributes are restricted for security. For untrusted
+code, run the client with sandbox=True.
 """

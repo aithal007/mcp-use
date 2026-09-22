@@ -471,3 +471,82 @@ return a + b
 
         assert result["error"] is None
         assert result["result"] == 3
+
+
+class TestCodeExecutorNamespaceEscapes:
+    """Regression tests for the in-process namespace-escape hardening.
+
+    Before this hardening, `_build_namespace()` injected the real `asyncio`
+    module, so `asyncio.create_subprocess_shell(...)` gave zero-dunder remote
+    code execution that the DANGEROUS_PATTERNS scan never saw, and `getattr`
+    was unrestricted so `getattr(x, "__class__")` walked to `__subclasses__`.
+    """
+
+    @pytest.mark.asyncio
+    async def test_asyncio_subprocess_not_reachable(self, code_executor):
+        """The safe asyncio stand-in must not expose process-spawning APIs."""
+        for attr in ("create_subprocess_shell", "create_subprocess_exec", "subprocess"):
+            code = f'return hasattr(asyncio, "{attr}")'
+            result = await code_executor.execute(code, timeout=5.0)
+            assert result["error"] is None
+            assert result["result"] is False, f"asyncio.{attr} must not be reachable"
+
+    @pytest.mark.asyncio
+    async def test_asyncio_event_loop_not_reachable(self, code_executor):
+        """Event-loop accessors are excluded (loop -> subprocess/connection escape)."""
+        for attr in ("get_event_loop", "get_running_loop", "new_event_loop", "to_thread", "open_connection"):
+            code = f'return hasattr(asyncio, "{attr}")'
+            result = await code_executor.execute(code, timeout=5.0)
+            assert result["error"] is None
+            assert result["result"] is False, f"asyncio.{attr} must not be reachable"
+
+    @pytest.mark.asyncio
+    async def test_asyncio_gather_still_works(self, code_executor):
+        """The concurrency primitives code-mode advertises must still work."""
+        code = """
+async def double(x):
+    await asyncio.sleep(0)
+    return x * 2
+
+vals = await asyncio.gather(double(1), double(2), double(3))
+return sum(vals)
+"""
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["error"] is None
+        assert result["result"] == 12
+
+    @pytest.mark.asyncio
+    async def test_getattr_rejects_dunder_via_concat(self, code_executor):
+        """getattr wrapper blocks a dunder name built by concatenation.
+
+        The name is assembled at runtime so it dodges the source-text denylist;
+        the wrapper is the layer that must catch it.
+        """
+        code = 'name = "__cla" + "ss__"\nreturn getattr((), name)'
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["result"] is None
+        assert result["error"] is not None
+        assert "private attribute" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_getattr_allows_public_attribute(self, code_executor):
+        """Ordinary getattr on a public attribute is unaffected."""
+        code = 'return getattr("abc", "upper")()'
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["error"] is None
+        assert result["result"] == "ABC"
+
+    @pytest.mark.asyncio
+    async def test_fullwidth_unicode_denylist_bypass_blocked(self, code_executor):
+        """NFKC normalization catches fullwidth homoglyphs of a dunder pattern."""
+        # Fullwidth "__class__" -> CPython would NFKC it to the real dunder.
+        code = "return ().＿＿class＿＿"
+        result = await code_executor.execute(code, timeout=5.0)
+
+        assert result["result"] is None
+        assert result["error"] is not None
+        assert "disallowed pattern" in result["error"]
+        assert result["logs"] == []

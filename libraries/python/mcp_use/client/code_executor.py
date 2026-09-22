@@ -10,7 +10,9 @@ import asyncio
 import io
 import re
 import time
+import unicodedata
 from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 
 from mcp_use.logging import logger
@@ -28,12 +30,15 @@ if TYPE_CHECKING:
 # tool-wrapper functions), so it does not depend on `type`, `eval`, `exec`, or
 # `import` being reachable.
 #
-# IMPORTANT: This is a defense-in-depth denylist, NOT a sandbox. It is a simple
+# IMPORTANT: This is a defense-in-depth tripwire, NOT a sandbox. It is a simple
 # substring scan and can be bypassed by string obfuscation or dynamic attribute
 # construction, e.g.:
 #   getattr(x, chr(95) * 2 + "class" + chr(95) * 2)
 #   name = "__sub" + "classes__"; getattr(y, name)
-# The only real isolation boundary for untrusted code is running with
+# The scan is applied to an NFKC-normalized copy of the source so that fullwidth
+# / compatibility-form homoglyphs (e.g. "＿＿ｃｌａｓｓ＿＿", which CPython normalizes
+# to "__class__" at parse time) cannot slip an ASCII substring past it. The only
+# real isolation boundary for untrusted code is running with
 # `MCPClient(sandbox=True)`, which executes code in an isolated E2B sandbox
 # rather than in-process via `exec()`.
 DANGEROUS_PATTERNS: list[str] = [
@@ -47,7 +52,86 @@ DANGEROUS_PATTERNS: list[str] = [
     "__code__",
     "__closure__",
     "__getattribute__",
+    "__class__",
+    "__dict__",
+    "__getattr__",
+    "__reduce__",
+    "__init_subclass__",
+    "__subclasshook__",
+    "__loader__",
+    "__spec__",
 ]
+
+# asyncio names that are safe to expose to agent-written code: they compose
+# coroutines and provide concurrency primitives, but none of them spawn a
+# process, open a socket, or hand back the event loop (from which
+# `loop.subprocess_exec` / `loop.run_in_executor` / `loop.create_connection`
+# would be reachable). Deliberately EXCLUDED: create_subprocess_shell,
+# create_subprocess_exec, open_connection, start_server, to_thread, run,
+# get_event_loop, get_running_loop, new_event_loop, set_event_loop,
+# run_coroutine_threadsafe, and the `subprocess`/`unix_events` submodules.
+_SAFE_ASYNCIO_NAMES: tuple[str, ...] = (
+    "gather",
+    "sleep",
+    "wait_for",
+    "wait",
+    "shield",
+    "as_completed",
+    "TimeoutError",
+    "CancelledError",
+    "Lock",
+    "Event",
+    "Condition",
+    "Semaphore",
+    "BoundedSemaphore",
+    "Queue",
+    "LifoQueue",
+    "PriorityQueue",
+    "QueueEmpty",
+    "QueueFull",
+)
+
+
+def _build_safe_asyncio() -> SimpleNamespace:
+    """Return a restricted stand-in for the `asyncio` module.
+
+    Exposes only the names in `_SAFE_ASYNCIO_NAMES` so that agent code can still
+    do the thing code-mode advertises it for -- run tool calls concurrently with
+    `asyncio.gather(...)` -- without the full module surface. The previous
+    implementation injected the real `asyncio` module, which exposed
+    `asyncio.create_subprocess_shell(...)` and friends: a zero-dunder,
+    zero-import remote-code-execution path that the DANGEROUS_PATTERNS scan never
+    saw.
+    """
+    return SimpleNamespace(**{name: getattr(asyncio, name) for name in _SAFE_ASYNCIO_NAMES})
+
+
+def _is_private_attr_name(name: Any) -> bool:
+    """True if `name` denotes an underscore-prefixed attribute.
+
+    Normalizes with NFKC first so that compatibility homoglyphs of the
+    underscore cannot dodge the check the way they dodge a raw ASCII compare.
+    """
+    if not isinstance(name, str):
+        return False
+    return unicodedata.normalize("NFKC", name).startswith("_")
+
+
+def _safe_getattr(obj: Any, name: Any, *default: Any) -> Any:
+    """`getattr` that refuses private/dunder attribute names.
+
+    Agent code legitimately uses `getattr(result, "text", "")`; it has no
+    legitimate need for `getattr(x, "__class__")`, which is the documented way to
+    reach `__base__`/`__subclasses__` while dodging the source-text denylist.
+    Blocking underscore-prefixed names (NFKC-normalized) closes that path without
+    breaking ordinary attribute access.
+    """
+    if _is_private_attr_name(name):
+        raise AttributeError(
+            f"access to private attribute '{name}' is not allowed in code execution "
+            "(use MCPClient(sandbox=True) for untrusted code)"
+        )
+    return getattr(obj, name, *default)
 
 
 class CodeExecutor:
@@ -57,12 +141,15 @@ class CodeExecutor:
     agent-written code can call MCP tools through dynamically generated wrapper
     functions. It is NOT a security sandbox and has two known limitations:
 
-    1. Namespace hardening (removing `type` from builtins, denylisting dangerous
-       dunder patterns like `__subclasses__`/`__globals__`) is defense-in-depth,
-       not isolation. Determined, obfuscated code can still escape an in-process
-       `exec()`-based namespace. For untrusted code, multi-tenant environments,
-       or production use, run with `MCPClient(sandbox=True)` to execute in an
-       isolated E2B sandbox instead.
+    1. Namespace hardening (removing `type` from builtins, exposing only a
+       restricted `asyncio` stand-in instead of the real module, wrapping
+       `getattr` to reject dunder names, and NFKC-normalized denylisting of
+       dangerous dunder patterns) is defense-in-depth, not isolation. It closes
+       the trivial, zero-dunder escapes (e.g. `asyncio.create_subprocess_shell`)
+       but a determined attacker can still reach a function object's
+       `__globals__` via a dunder that the source scan must catch. For untrusted
+       code, multi-tenant environments, or production use, run with
+       `MCPClient(sandbox=True)` to execute in an isolated E2B sandbox instead.
     2. The per-execution timeout (see `execute()`) is implemented with
        `asyncio.wait_for`, which relies on cooperative cancellation at `await`
        points. It CANNOT preempt a blocking, CPU-bound synchronous loop with no
@@ -198,8 +285,12 @@ class CodeExecutor:
         Returns:
             The first matched dangerous pattern, or None if none were found.
         """
+        # Normalize first: CPython applies NFKC to identifiers at parse time, so
+        # a fullwidth "＿＿ｃｌａｓｓ＿＿" compiles to "__class__" yet would not match a
+        # raw ASCII substring scan. Normalizing the copy we scan closes that gap.
+        normalized = unicodedata.normalize("NFKC", code)
         for pattern in DANGEROUS_PATTERNS:
-            if pattern in code:
+            if pattern in code or pattern in normalized:
                 return pattern
         return None
 
@@ -258,7 +349,11 @@ class CodeExecutor:
             "all": all,
             "isinstance": isinstance,
             "hasattr": hasattr,
-            "getattr": getattr,
+            # `getattr` is wrapped to refuse underscore/dunder attribute names
+            # (e.g. getattr(x, "__class__")), which is the documented way to walk
+            # to __subclasses__ while dodging the DANGEROUS_PATTERNS source scan.
+            # Ordinary access like getattr(result, "text", "") still works.
+            "getattr": _safe_getattr,
             # NOTE: `type` is intentionally NOT exposed here. `type(obj)` is the
             # canonical entry point for the `().__class__.__base__.__subclasses__()`
             # style sandbox-escape gadget. Removing it does not fully close the
@@ -283,7 +378,11 @@ class CodeExecutor:
 
         namespace = {
             "__builtins__": safe_builtins,
-            "asyncio": asyncio,  # Allow async/await
+            # A restricted asyncio stand-in: enough for `await` and
+            # `asyncio.gather(...)`-style concurrent tool calls, without
+            # create_subprocess_*/open_connection/to_thread/event-loop access.
+            # (`await` itself needs nothing in scope; the wrapper is `async def`.)
+            "asyncio": _build_safe_asyncio(),
         }
 
         # Add search_tools function
