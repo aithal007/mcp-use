@@ -286,8 +286,7 @@ export abstract class BaseConnector {
       logger.debug(
         "[Auto] Refreshing tools cache due to list_changed notification"
       );
-      const result = await this.client.listTools();
-      this.toolsCache = (result.tools ?? []) as Tool[];
+      this.toolsCache = await this.listAllTools();
       logger.debug(
         `[Auto] Refreshed tools cache: ${this.toolsCache.length} tools`
       );
@@ -606,13 +605,10 @@ export abstract class BaseConnector {
         }
       : null;
 
-    // Fetch and cache tools
+    // Fetch and cache tools (all pages, not just the first)
     // Gracefully handle servers that don't implement tools/list or have no tools
     try {
-      const listToolsRes = await this.executeRequest(() =>
-        this.client!.listTools(undefined, defaultRequestOptions)
-      );
-      this.toolsCache = (listToolsRes.tools ?? []) as Tool[];
+      this.toolsCache = await this.listAllTools(defaultRequestOptions);
       logger.debug(`Fetched ${this.toolsCache.length} tools from server`);
     } catch (err: unknown) {
       if (isOAuthInteractionRequired(err)) throw err;
@@ -719,6 +715,43 @@ export abstract class BaseConnector {
   }
 
   /**
+   * Follow an MCP list method's pagination to completion.
+   *
+   * Cursor rules per the MCP spec: cursors are opaque; iteration ends only when
+   * `nextCursor` is `null` or absent (an empty-string cursor is a valid
+   * "there is another page" signal, not the end); and a repeated cursor is
+   * treated as a server fault and rejected rather than looped on forever.
+   *
+   * @param label - Method name used in the repeated-cursor error message.
+   * @param fetchPage - Fetches one page for the given cursor (`undefined` = first page).
+   * @returns Every item accumulated across all pages.
+   */
+  private async paginateAll<TItem>(
+    label: string,
+    fetchPage: (
+      cursor: string | undefined
+    ) => Promise<{ items: TItem[]; nextCursor?: string | null }>
+  ): Promise<TItem[]> {
+    const all: TItem[] = [];
+    const seenCursors = new Set<string>();
+    let cursor: string | undefined = undefined;
+    for (;;) {
+      const page = await fetchPage(cursor);
+      all.push(...page.items);
+      const next = page.nextCursor;
+      // `!= null` ends iteration on both `null` and `undefined`, while still
+      // continuing on an empty-string cursor (a spec-legal "next page").
+      if (next == null) break;
+      if (seenCursors.has(next)) {
+        throw new Error(`${label} returned a repeated pagination cursor`);
+      }
+      seenCursors.add(next);
+      cursor = next;
+    }
+    return all;
+  }
+
+  /**
    * List all available tools from the MCP server.
    * This method fetches fresh tools from the server, unlike the `tools` getter which returns cached tools.
    *
@@ -739,6 +772,50 @@ export abstract class BaseConnector {
       `[listTools] Returned ${tools.length} tools:`,
       tools.map((t) => t.name)
     );
+    return tools;
+  }
+
+  /**
+   * List all tools from the server, following pagination to completion.
+   *
+   * {@link listTools} returns only the first page and discards `nextCursor`,
+   * so a server that paginates its catalog silently loses every tool past the
+   * first page. This method follows every `nextCursor` until the catalog is
+   * exhausted. Cursors are treated as opaque per the MCP spec: iteration ends
+   * only when `nextCursor` is absent (an empty-string cursor is a valid
+   * "there is another page" signal, not the end), and a repeated cursor is
+   * treated as a server fault and rejected rather than looped on forever.
+   *
+   * @param options - Optional request options
+   * @returns Every tool across all result pages
+   */
+  async listAllTools(options?: RequestOptions): Promise<Tool[]> {
+    // Held across the loop: disconnect() clears this.client, so re-reading it
+    // per page could dereference null mid-listing instead of failing cleanly.
+    const client = this.client;
+    if (!client) {
+      throw new Error("MCP client is not connected");
+    }
+
+    logger.debug("[listAllTools] Fetching all tools (auto-pagination)...");
+    // A -32601 ("tools/list not implemented") is intentionally NOT swallowed
+    // here, matching single-page listTools(): the caller decides what an absent
+    // method means. initialize() treats it as "no tools" ([]), while
+    // refreshToolsCache() keeps the previously discovered tools rather than
+    // wiping them when a refresh transiently fails.
+    const tools = await this.executeRequest(() =>
+      this.paginateAll<Tool>("tools/list", async (cursor) => {
+        const result = (await client.listTools({ cursor }, options)) as {
+          tools?: Tool[];
+          nextCursor?: string | null;
+        };
+        return {
+          items: (result.tools ?? []) as Tool[],
+          nextCursor: result.nextCursor,
+        };
+      })
+    );
+    logger.debug(`[listAllTools] Returned ${tools.length} tools`);
     return tools;
   }
 
@@ -926,6 +1003,56 @@ export abstract class BaseConnector {
     } catch (err: unknown) {
       const error = err as Error & { code?: number };
       // Gracefully handle if server advertises but doesn't actually support it
+      if (error.code === -32601) {
+        logger.debug("Server advertised prompts but method not found");
+        return { prompts: [] };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * List all prompts from the server, following pagination to completion.
+   *
+   * {@link listPrompts} returns only the first page. This follows every
+   * `nextCursor` so the full prompt list is returned, with the same opaque-
+   * cursor rules as {@link listAllTools} (absent cursor ends iteration, empty
+   * string continues, a repeated cursor is rejected).
+   *
+   * @param options - Optional request options
+   * @returns Every prompt across all result pages
+   */
+  async listAllPrompts(options?: RequestOptions): Promise<{
+    /** Prompts returned across all result pages. */
+    prompts: any[];
+  }> {
+    const client = this.client;
+    if (!client) {
+      throw new Error("MCP client is not connected");
+    }
+
+    // Check if server advertises prompts capability
+    if (!this.capabilitiesCache?.prompts) {
+      logger.debug("Server does not advertise prompts capability, skipping");
+      return { prompts: [] };
+    }
+
+    try {
+      logger.debug("Listing all prompts (with auto-pagination)");
+      const prompts = await this.executeRequest(() =>
+        this.paginateAll<any>("prompts/list", async (cursor) => {
+          const result = (await client.listPrompts({ cursor }, options)) as {
+            prompts?: any[];
+            nextCursor?: string | null;
+          };
+          return { items: result.prompts ?? [], nextCursor: result.nextCursor };
+        })
+      );
+      return { prompts };
+    } catch (err: unknown) {
+      const error = err as Error & { code?: number };
+      // Match listPrompts(): a server that advertises prompts but answers
+      // -32601 is treated as having no prompts rather than as an error.
       if (error.code === -32601) {
         logger.debug("Server advertised prompts but method not found");
         return { prompts: [] };
